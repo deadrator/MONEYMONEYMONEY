@@ -242,6 +242,17 @@ class ClassifyRenderedTests(unittest.TestCase):
         label, _ = f.classify_rendered("tango", "https://www.instagram.com/tango/", text)
         self.assertEqual(label, "unknown")
 
+    def test_bare_name_and_follower_count_is_taken(self):
+        # Matches the text the real page rendered for @tango.
+        text = ("Log In\nSign Up\ntango\n1,294 followers\n0 following\n"
+                "Wong Tango\nMeta\nAbout\nBlog\nJobs\nHelp\nAPI\nPrivacy\nTerms")
+        label, _ = f.classify_rendered("tango", "https://www.instagram.com/tango/", text)
+        self.assertEqual(label, "taken")
+
+    def test_bare_name_without_stats_is_unknown(self):
+        label, _ = f.classify_rendered("tango", "https://www.instagram.com/tango/", "tango\nLog In")
+        self.assertEqual(label, "unknown")
+
     def test_login_redirect_is_unknown(self):
         label, _ = f.classify_rendered(
             "tango", "https://www.instagram.com/accounts/login/?next=/tango/",

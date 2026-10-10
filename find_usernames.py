@@ -406,6 +406,9 @@ BROWSER_SETTLE_MS = 3000   # wait after load so JavaScript can render
 BROWSER_TIMEOUT_MS = 30000
 
 
+_FOLLOWERS_RE = re.compile(r"\d[\d,.]*\s*[KkMm]?\s+followers", re.IGNORECASE)
+
+
 def classify_rendered(username: str, final_url: str, text: str) -> Tuple[str, str]:
     """Classify the visible text of a rendered profile page. Pure function."""
     if "/accounts/login" in final_url:
@@ -415,8 +418,14 @@ def classify_rendered(username: str, final_url: str, text: str) -> Tuple[str, st
         return "not_found", "rendered 'page isn't available' message"
     mention = re.search(
         rf"@{re.escape(username)}(?![A-Za-z0-9._])", text, re.IGNORECASE)
-    has_stats = any(word in lowered for word in ("followers", "following", "posts"))
-    if mention and has_stats:
+    # The rendered profile shows the bare name on its own line (e.g. "tango")
+    # and a follower count (e.g. "1,294 followers").
+    name_line = any(
+        line.strip().lower() in (username.lower(), f"@{username.lower()}")
+        for line in text.splitlines()
+    )
+    has_stats = bool(_FOLLOWERS_RE.search(text)) or "following" in lowered
+    if (mention or name_line) and has_stats:
         return "taken", "rendered profile for this username"
     return "unknown", "rendered page is neither a profile nor a not-found message"
 
