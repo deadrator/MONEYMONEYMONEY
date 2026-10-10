@@ -46,9 +46,14 @@ Caveats
 * Instagram rules are enforced: letters, numbers, periods and underscores only;
   no leading/trailing period; no double period.
 
-Install (for the dictionary style)
-----------------------------------
+Install
+-------
     pip install -r requirements.txt
+    python -m playwright install chromium
+
+Playwright drives a headless Chromium browser for the availability check
+(the default). Use --checker http for the old plain-HTTP check, which Instagram
+serves as a generic page and so cannot tell taken from free.
 
 Usage
 -----
@@ -59,6 +64,8 @@ Usage
     python3 find_usernames.py --style pronounceable    # made-up names instead
     python3 find_usernames.py --style wordlist --wordlist words.txt
     python3 find_usernames.py --output hits.txt
+    python3 find_usernames.py --inspect tango zion     # see what the browser renders
+    python3 find_usernames.py --headed                 # show the browser window
 
 Python 3.8+. The dictionary style needs `wordfreq` and `english-words`; every
 other style is standard library only.
@@ -67,7 +74,9 @@ other style is standard library only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
+import os
 import random
 import re
 import sys
@@ -258,6 +267,21 @@ def _owner_matches(username: str, body: str) -> bool:
     return bool(match) and match.group(1).lower() == username.lower()
 
 
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TITLE_RE = re.compile(
+    r"""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']""",
+    re.IGNORECASE,
+)
+
+
+def _title_matches(username: str, body: str) -> bool:
+    """Profile titles look like 'Name (@username) \u2022 Instagram photos and videos'."""
+    needle = f"(@{username})".lower()
+    candidates = [m.group(1) for m in _TITLE_RE.finditer(body)]
+    candidates += [m.group(1) for m in _OG_TITLE_RE.finditer(body)]
+    return any(needle in c.lower() for c in candidates)
+
+
 def classify_response(
     username: str,
     status: int,
@@ -279,7 +303,7 @@ def classify_response(
     lowered = body.lower()
     if any(marker in lowered for marker in NOT_FOUND_MARKERS):
         return "not_found", "200, but 'page isn't available' page"
-    if _owner_matches(username, body):
+    if _owner_matches(username, body) or _title_matches(username, body):
         return "taken", "200, profile page for this username"
     return "unknown", "200, but neither a profile nor a not-found page"
 
@@ -294,8 +318,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def check_profile(username: str, timeout: float = 10.0) -> Tuple[str, str]:
-    """Fetch the public profile page and classify it. Returns (label, reason)."""
+def fetch_raw(username: str, timeout: float = 10.0) -> Tuple[Optional[int], Dict[str, str], str]:
+    """
+    Fetch the profile page without following redirects.
+    Returns (status, headers, body). status is None on network failure;
+    body then holds the error text.
+    """
     req = urllib.request.Request(
         PROFILE_URL.format(username=username),
         headers={
@@ -307,17 +335,211 @@ def check_profile(username: str, timeout: float = 10.0) -> Tuple[str, str]:
     try:
         with _OPENER.open(req, timeout=timeout) as resp:
             body = resp.read(MAX_BODY_BYTES).decode("utf-8", "replace")
-            return classify_response(username, resp.status, None, body)
+            return resp.status, dict(resp.headers), body
     except urllib.error.HTTPError as exc:
         # Redirects and error statuses both arrive here.
-        location = exc.headers.get("Location") if exc.headers else None
+        headers = dict(exc.headers) if exc.headers else {}
         try:
             body = exc.read(MAX_BODY_BYTES).decode("utf-8", "replace")
         except OSError:
             body = ""
-        return classify_response(username, exc.code, location, body)
+        return exc.code, headers, body
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return "error", f"network error: {exc}"
+        return None, {}, str(exc)
+
+
+def check_profile(username: str, timeout: float = 10.0) -> Tuple[str, str]:
+    """Fetch the public profile page and classify it. Returns (label, reason)."""
+    status, headers, body = fetch_raw(username, timeout)
+    if status is None:
+        return "error", f"network error: {body}"
+    location = headers.get("Location") or headers.get("location")
+    return classify_response(username, status, location, body)
+
+
+def inspect_profiles(usernames: List[str], out_dir: str = "inspect_output") -> None:
+    """
+    Diagnostic: save each profile page's raw HTML and print the parts the
+    classifier relies on. Use this to find the real markers for taken vs free.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    for username in usernames:
+        status, headers, body = fetch_raw(username)
+        path = os.path.join(out_dir, f"{username}.html")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+
+        print(f"\n=== @{username} ===")
+        if status is None:
+            print(f"network error: {body}")
+            continue
+        print(f"HTTP status : {status}")
+        print(f"Content-Type: {headers.get('Content-Type', '?')}")
+        location = headers.get("Location") or headers.get("location")
+        if location:
+            print(f"Location    : {location}")
+        print(f"Body length : {len(body)} chars  (saved to {path})")
+
+        title = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+        print(f"<title>     : {title.group(1).strip()[:200] if title else '(none)'}")
+
+        metas = re.findall(r"<meta[^>]+>", body, re.IGNORECASE)
+        relevant = [m for m in metas if re.search(r"og:|description|twitter:", m, re.I)]
+        print(f"og/description meta tags ({len(relevant)}):")
+        for m in relevant[:10]:
+            print(f"  {m[:200]}")
+
+        label, reason = classify_response(username, status, location, body)
+        print(f"classifier  : {label} ({reason})")
+
+
+# ---------------------------------------------------------------------------
+# Browser checker (Playwright, headless Chromium)
+# ---------------------------------------------------------------------------
+#
+# Instagram serves a generic app shell to plain HTTP clients, so the HTML alone
+# does not say whether a name is taken. A real browser runs the page's
+# JavaScript first, and the rendered text does show "Sorry, this page isn't
+# available" or the profile's posts/followers.
+
+BROWSER_SETTLE_MS = 3000   # wait after load so JavaScript can render
+BROWSER_TIMEOUT_MS = 30000
+
+
+def classify_rendered(username: str, final_url: str, text: str) -> Tuple[str, str]:
+    """Classify the visible text of a rendered profile page. Pure function."""
+    if "/accounts/login" in final_url:
+        return "unknown", "redirected to login page"
+    lowered = text.lower()
+    if any(marker in lowered for marker in NOT_FOUND_MARKERS):
+        return "not_found", "rendered 'page isn't available' message"
+    mention = re.search(
+        rf"@{re.escape(username)}(?![A-Za-z0-9._])", text, re.IGNORECASE)
+    has_stats = any(word in lowered for word in ("followers", "following", "posts"))
+    if mention and has_stats:
+        return "taken", "rendered profile for this username"
+    return "unknown", "rendered page is neither a profile nor a not-found message"
+
+
+class BrowserChecker:
+    """Loads each profile in Chromium and classifies what it renders.
+
+    Use as a context manager so the browser is closed afterwards:
+
+        with BrowserChecker() as checker:
+            label, reason = checker("tango")
+    """
+
+    def __init__(
+        self,
+        headless: bool = True,
+        executable_path: Optional[str] = None,
+        settle_ms: int = BROWSER_SETTLE_MS,
+        timeout_ms: int = BROWSER_TIMEOUT_MS,
+    ) -> None:
+        self.headless = headless
+        self.executable_path = executable_path
+        self.settle_ms = settle_ms
+        self.timeout_ms = timeout_ms
+        self._playwright = None
+        self._browser = None
+        self._page = None
+
+    def __enter__(self) -> "BrowserChecker":
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise RuntimeError(
+                "The browser checker needs Playwright. Run:\n"
+                "  pip install -r requirements.txt\n"
+                "  python -m playwright install chromium"
+            ) from exc
+        self._playwright = sync_playwright().start()
+        launch_kwargs = {"headless": self.headless}
+        if self.executable_path:
+            launch_kwargs["executable_path"] = self.executable_path
+        try:
+            self._browser = self._playwright.chromium.launch(**launch_kwargs)
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(
+                f"Could not start Chromium: {exc}\n"
+                "Run: python -m playwright install chromium"
+            ) from exc
+        context = self._browser.new_context(
+            user_agent=USER_AGENT,
+            locale="en-US",
+            viewport={"width": 1280, "height": 900},
+        )
+        self._page = context.new_page()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._browser is not None:
+            self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            self._playwright.stop()
+            self._playwright = None
+
+    def render(self, username: str) -> Tuple[Optional[int], str, str]:
+        """Load the profile. Returns (http_status, final_url, visible_text)."""
+        url = PROFILE_URL.format(username=username)
+        response = self._page.goto(
+            url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._page.wait_for_timeout(self.settle_ms)
+        status = response.status if response else None
+        return status, self._page.url, self._page.inner_text("body")
+
+    def screenshot(self, path: str) -> None:
+        self._page.screenshot(path=path, full_page=False)
+
+    def __call__(self, username: str) -> Tuple[str, str]:
+        try:
+            status, final_url, text = self.render(username)
+        except Exception as exc:  # Playwright raises several error types
+            return "error", f"browser error: {exc}"
+        if status == 404:
+            return "not_found", "HTTP 404"
+        if status == 429:
+            return "rate_limited", "HTTP 429 (too many requests)"
+        if status in (401, 403):
+            return "blocked", f"HTTP {status} (Instagram refused the request)"
+        return classify_rendered(username, final_url, text)
+
+
+def inspect_browsers(
+    usernames: List[str],
+    out_dir: str = "inspect_output",
+    headless: bool = True,
+    executable_path: Optional[str] = None,
+) -> None:
+    """Diagnostic: render each profile, save text and screenshot, show the verdict."""
+    os.makedirs(out_dir, exist_ok=True)
+    with BrowserChecker(headless=headless, executable_path=executable_path) as checker:
+        for username in usernames:
+            print(f"\n=== @{username} ===")
+            try:
+                status, final_url, text = checker.render(username)
+            except Exception as exc:
+                print(f"browser error: {exc}")
+                continue
+            base = os.path.join(out_dir, username)
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(text)
+            checker.screenshot(base + ".png")
+            label, reason = classify_rendered(username, final_url, text)
+            print(f"HTTP status : {status}")
+            print(f"Final URL   : {final_url}")
+            print(f"Saved       : {base}.txt and {base}.png")
+            print("First lines of rendered text:")
+            for line in [l.strip() for l in text.splitlines() if l.strip()][:15]:
+                print(f"  | {line[:150]}")
+            print(f"classifier  : {label} ({reason})")
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +616,9 @@ def run(
         f"{len(hits)} possibly-available. Confirm each one in the Instagram app "
         "before using it.",
     )
+    if counts.get("unknown"):
+        print("Many 'unknown' results: run  python3 find_usernames.py --inspect NAME "
+              "  to see the real page.")
     return hits
 
 
@@ -420,6 +645,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, help="random seed for reproducible runs")
     p.add_argument("--dry-run", action="store_true",
                    help="print candidates without checking Instagram")
+    p.add_argument("--inspect", nargs="+", metavar="USERNAME",
+                   help="diagnostic: save and show what the checker sees for each name")
+    p.add_argument("--checker", choices=["browser", "http"], default="browser",
+                   help="how to check profiles: browser (Playwright, default) or http")
+    p.add_argument("--headed", action="store_true",
+                   help="show the browser window (useful for login walls or challenges)")
+    p.add_argument("--browser-path", metavar="PATH",
+                   help="advanced: use a specific Chromium executable")
     args = p.parse_args(argv)
 
     if not 1 <= args.count <= 5:
@@ -445,6 +678,19 @@ def load_words_for(args: argparse.Namespace) -> Optional[List[str]]:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    if args.inspect:
+        names = [u.lstrip("@") for u in args.inspect]
+        try:
+            if args.checker == "http":
+                inspect_profiles(names)
+            else:
+                inspect_browsers(names, headless=not args.headed,
+                                 executable_path=args.browser_path)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     try:
         word_list = load_words_for(args)
     except RuntimeError as exc:
@@ -466,21 +712,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"@{cand}")
         return 0
 
-    try:
-        hits = run(
-            count=args.count,
-            min_len=args.min_len,
-            max_len=args.max_len,
-            style=args.style,
-            word_list=word_list,
-            delay=args.delay,
-            max_checks=args.max_checks,
-            output=args.output,
-            seed=args.seed,
-        )
-    except KeyboardInterrupt:
-        print("\nStopped by user.", file=sys.stderr)
-        return 130
+    with contextlib.ExitStack() as stack:
+        if args.checker == "browser":
+            try:
+                checker = stack.enter_context(
+                    BrowserChecker(headless=not args.headed,
+                                   executable_path=args.browser_path))
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+        else:
+            checker = check_profile
+
+        try:
+            hits = run(
+                count=args.count,
+                min_len=args.min_len,
+                max_len=args.max_len,
+                style=args.style,
+                word_list=word_list,
+                delay=args.delay,
+                max_checks=args.max_checks,
+                output=args.output,
+                checker=checker,
+                seed=args.seed,
+            )
+        except KeyboardInterrupt:
+            print("\nStopped by user.", file=sys.stderr)
+            return 130
 
     if not hits:
         print("No available candidates found. Try --max-checks higher or another --style.")
